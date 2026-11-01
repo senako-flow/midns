@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const db = @import("db");
 const dns = @import("dns");
 
 pub const Listener = struct {
@@ -9,7 +10,10 @@ pub const Listener = struct {
     addr: std.Io.net.IpAddress,
     socket: std.Io.net.Socket,
 
-    pub fn new(io: std.Io, allocator: std.mem.Allocator, ip: []const u8, port: u16) !Listener {
+    cache: db.Cache,
+    postgre: db.Postgre,
+
+    pub fn new(allocator: std.mem.Allocator, io: std.Io, pg_url: []const u8, ip: []const u8, port: u16) !Listener {
         const addr = try std.Io.net.IpAddress.parse(ip, port);
 
         const socket = try std.Io.net.IpAddress.bind(&addr, io, .{
@@ -17,15 +21,28 @@ pub const Listener = struct {
             .protocol = .udp,
         });
 
+        var bytes: [8]u8 = undefined;
+        try std.Io.randomSecure(io, &bytes);
+
+        const seed = std.mem.readInt(u64, &bytes, .little);
+
+        const cache = db.Cache.init(allocator, io, seed);
+
+        const postgre = try db.Postgre.init(allocator, io, pg_url);
+
         return .{
             .io = io,
             .allocator = allocator,
             .addr = addr,
             .socket = socket,
+            .cache = cache,
+            .postgre = postgre,
         };
     }
 
     pub fn deinit(self: *Listener) void {
+        self.cache.deinit();
+        self.postgre.deinit();
         self.socket.close(self.io);
     }
 
@@ -79,7 +96,7 @@ pub const Listener = struct {
             return try self.respond_with_error(&packet.from, &header, null, null, .NotImp, .NotTruncated);
         }
 
-        if (header.qd != 1) {
+        if (header.qd != 1 or header.an != 0 or header.ns != 0 or header.ar > 1) {
             return try self.respond_with_error(&packet.from, &header, null, null, .FormatError, .NotTruncated);
         }
 
@@ -87,26 +104,78 @@ pub const Listener = struct {
             return try self.respond_with_error(&packet.from, &header, null, null, .FormatError, .NotTruncated);
         };
 
+        const question_end = 12 + question.get_size();
+
         var edns0: ?dns.EDns0 = null;
-        if (header.ar > 0 and packet.data.len >= 12 + question.get_size()) {
-            edns0 = dns.EDns0.decode(packet.data[12 + question.get_size() ..]);
+        if (header.ar == 1) {
+            if (packet.data.len < question_end + 11) {
+                return try self.respond_with_error(&packet.from, &header, question, null, .FormatError, .NotTruncated);
+            }
+
+            edns0 = dns.EDns0.decode(packet.data[question_end..]) catch |err| {
+                switch (err) {
+                    dns.EDns0.Error.InvalidLength, dns.EDns0.Error.InvalidName, dns.EDns0.Error.NotOptRecord, dns.EDns0.Error.RdlenMismatch, dns.EDns0.Error.TrailingGarbage => {
+                        return try self.respond_with_error(&packet.from, &header, question, null, .FormatError, .NotTruncated);
+                    },
+                }
+            };
+
+            if (edns0.?.version != 0) {
+                return try self.respond_with_error(&packet.from, &header, question, edns0, .NoError, .NotTruncated);
+            }
+        }
+
+        if (header.ar != 1 and packet.data.len > question_end) {
+            return try self.respond_with_error(&packet.from, &header, question, null, .FormatError, .NotTruncated);
         }
 
         if (question.class != .IN) {
             return try self.respond_with_error(&packet.from, &header, question, edns0, .NotImp, .NotTruncated);
         }
 
-        switch (question.record) {
-            .A => {
-                return try self.respond_with_value(&packet.from, &header, question, edns0, &[_]u8{ 127, 0, 0, 1 });
-            },
-            .AAAA => {
-                return try self.respond_with_value(&packet.from, &header, question, edns0, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
-            },
-            else => {
-                return try self.respond_with_error(&packet.from, &header, question, edns0, .NotImp, .NotTruncated);
-            },
+        if (!question.record.is_supported()) {
+            return try self.respond_with_error(&packet.from, &header, question, edns0, .NotImp, .NotTruncated);
         }
+
+        const name = try question.get_name(self.allocator);
+        defer self.allocator.free(name);
+
+        const cached = try self.cache.get(name, question.record);
+        if (cached) |answers| {
+            defer {
+                for (answers) |answer| {
+                    self.allocator.free(answer.raw_data);
+                }
+                self.allocator.free(answers);
+            }
+            return try self.respond_with_answers(&packet.from, &header, question, edns0, answers);
+        }
+
+        const answers = self.postgre.get(name, question.record) catch |err| {
+            switch (err) {
+                db.Postgre.Error.NameExists => {
+                    return try self.respond_with_answers(&packet.from, &header, question, edns0, &.{});
+                },
+                db.Postgre.Error.NxDomain => {
+                    return try self.respond_with_error(&packet.from, &header, question, edns0, .NxDomain, .NotTruncated);
+                },
+                else => {
+                    return try self.respond_with_error(&packet.from, &header, question, edns0, .ServFail, .NotTruncated);
+                },
+            }
+        };
+
+        defer {
+            for (answers) |answer| {
+                self.allocator.free(answer.raw_data);
+            }
+
+            self.allocator.free(answers);
+        }
+
+        try self.respond_with_answers(&packet.from, &header, question, edns0, answers);
+
+        try self.cache.put_slice(name, question.record, answers);
     }
 
     fn respond_with_error(self: *Listener, from: *const std.Io.net.IpAddress, header: *dns.Header, question: ?dns.Question, edns0: ?dns.EDns0, rcode: dns.Rcode, tc: dns.TC) !void {
@@ -139,7 +208,10 @@ pub const Listener = struct {
 
         if (edns0) |e| {
             header.ar = 1;
+            option.dnssec_ok = e.dnssec_ok;
+
             if (e.version != 0) {
+                header.flags.rcode = .NoError;
                 option.rcode = 1;
             }
         }
@@ -157,11 +229,12 @@ pub const Listener = struct {
         try self.socket.send(self.io, from, writer.buffered());
     }
 
-    fn respond_with_value(self: *Listener, from: *const std.Io.net.IpAddress, header: *dns.Header, question: dns.Question, edns0: ?dns.EDns0, value: []const u8) !void {
-        header.an = 1;
+    fn respond_with_answers(self: *Listener, from: *const std.Io.net.IpAddress, header: *dns.Header, question: dns.Question, edns0: ?dns.EDns0, records: []const dns.Answer) !void {
         header.ar = 0;
         header.ns = 0;
         header.qd = 1;
+
+        header.an = @intCast(records.len);
 
         header.flags.qr = .Response;
         header.flags.rcode = .NoError;
@@ -185,19 +258,14 @@ pub const Listener = struct {
 
         if (edns0) |e| {
             header.ar = 1;
+            option.dnssec_ok = e.dnssec_ok;
+
             if (e.version != 0) {
                 header.an = 0;
+                header.flags.rcode = .NoError;
                 option.rcode = 1;
             }
         }
-
-        const answer = dns.Answer{
-            .ttl = 300,
-            .name = &[_]u8{ 0xc0, 0x0c },
-            .class = question.class,
-            .record = question.record,
-            .value = value,
-        };
 
         var buffer: [1232]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
@@ -206,7 +274,20 @@ pub const Listener = struct {
         try question.encode(&writer);
 
         if (header.an > 0) {
-            try answer.encode(&writer);
+            const limit = @min(max_payload, buffer.len);
+
+            var opt_size: usize = 0;
+            if (edns0) |_| {
+                opt_size = 11;
+            }
+
+            for (records) |record| {
+                if (writer.end + record.get_size() + opt_size > limit) {
+                    return try self.respond_with_error(from, header, question, edns0, .NoError, .Truncated);
+                }
+
+                try record.encode(&writer);
+            }
         }
 
         if (edns0) |_| {
