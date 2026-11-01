@@ -1,2 +1,0 @@
-a.example.com A
-b.example.com AAAA
