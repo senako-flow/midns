@@ -173,7 +173,10 @@ pub const Question = struct {
                 try respond.append(allocator, '.');
             }
 
-            try respond.appendSlice(allocator, self.raw[i .. i + label]);
+            for (self.raw[i .. i + label]) |c| {
+                try respond.append(allocator, std.ascii.toLower(c));
+            }
+
             i += label;
         }
 
@@ -187,7 +190,7 @@ pub const Answer = struct {
     class: dns.Class,
     record: dns.Record,
 
-    value: []const u8,
+    raw_data: []const u8,
 
     pub fn decode(v: []const u8) ?Answer {
         var offset: usize = 0;
@@ -235,14 +238,14 @@ pub const Answer = struct {
             return null;
         }
 
-        const value = v[offset + 10 .. offset + 10 + len];
+        const raw_data = v[offset + 10 .. offset + 10 + len];
 
         return .{
             .ttl = ttl,
             .name = v[0..offset],
             .class = class,
             .record = record,
-            .value = value,
+            .raw_data = raw_data,
         };
     }
 
@@ -252,10 +255,14 @@ pub const Answer = struct {
         std.mem.writeInt(u16, buffer[0..2], @backingInt(self.record), .big);
         std.mem.writeInt(u16, buffer[2..4], @backingInt(self.class), .big);
         std.mem.writeInt(u32, buffer[4..8], self.ttl, .big);
-        std.mem.writeInt(u16, buffer[8..10], @intCast(self.value.len), .big);
+        std.mem.writeInt(u16, buffer[8..10], @intCast(self.raw_data.len), .big);
 
         try writer.writeAll(self.name);
         try writer.writeAll(&buffer);
-        try writer.writeAll(self.value);
+        try writer.writeAll(self.raw_data);
+    }
+
+    pub fn get_size(self: Answer) usize {
+        return self.name.len + self.raw_data.len + 10;
     }
 };
