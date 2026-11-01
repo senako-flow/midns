@@ -9,18 +9,26 @@ pub const Edns0 = struct {
     dnssec_ok: bool,
     options: []const u8,
 
-    pub fn decode(v: []const u8) ?Edns0 {
+    pub const Error = error{
+        InvalidLength,
+        InvalidName,
+        NotOptRecord,
+        RdlenMismatch,
+        TrailingGarbage,
+    };
+
+    pub fn decode(v: []const u8) Error!Edns0 {
         if (v.len < 11) {
-            return null;
+            return Error.InvalidLength;
         }
 
         if (v[0] != 0) {
-            return null;
+            return Error.InvalidName;
         }
 
-        const recode: dns.Record = @fromBackingInt(@intCast(std.mem.readInt(u16, v[1..3], .big)));
-        if (recode != .OPT) {
-            return null;
+        const record: dns.Record = @fromBackingInt(@intCast(std.mem.readInt(u16, v[1..3], .big)));
+        if (record != .OPT) {
+            return Error.NotOptRecord;
         }
 
         const size = std.mem.readInt(u16, v[3..5], .big);
@@ -30,7 +38,11 @@ pub const Edns0 = struct {
         const rdlen = std.mem.readInt(u16, v[9..11], .big);
 
         if (v.len < 11 + rdlen) {
-            return null;
+            return Error.RdlenMismatch;
+        }
+
+        if (v.len > 11 + rdlen) {
+            return Error.TrailingGarbage;
         }
 
         var dnssec_ok = false;
