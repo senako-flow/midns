@@ -1,0 +1,10 @@
+[local]
+port = 53
+host = "0.0.0.0"
+
+[connect]
+postgre_url = "postgresql://username:password@localhost:5432/database_name"
+
+[security]
+nodata_ttl = 300
+nxdomain_ttl = 60

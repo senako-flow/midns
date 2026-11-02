@@ -8,6 +8,10 @@
             .url = "git+https://github.com/karlseguin/pg.zig?ref=master#0ccd7d9dabce32e4cee0dd789d8007934099a0f9",
             .hash = "pg-0.0.0-Wp_7geJVBwDaf2o8erlmelEP5RBEuMESnFWWrNLQneEy",
         },
+        .toml = .{
+            .url = "git+https://github.com/sam701/zig-toml?ref=zig-0.17#4a13e49ce7d19ac2df8b87962d9f23c0f5dd5bdd",
+            .hash = "toml-0.3.0-bV14BRmkAQDSILPPyXc31aAXPtJa1Uh8Frug3i6InAUc",
+        },
     },
     .paths = .{
         "build.zig",

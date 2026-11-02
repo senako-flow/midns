@@ -8,6 +8,17 @@ pub fn build(b: *std.Build) void {
 
     const pg_module = b.dependency("pg", .{}).module("pg");
 
+    const toml_module = b.dependency("toml", .{}).module("toml");
+
+    const config = b.addModule("config", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/config/_.zig"),
+        .imports = &.{
+            .{ .name = "toml", .module = toml_module },
+        },
+    });
+
     const dns = b.addModule("dns", .{
         .target = target,
         .optimize = optimize,
@@ -31,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "db", .module = db },
             .{ .name = "dns", .module = dns },
+            .{ .name = "config", .module = config },
         },
     });
 
@@ -43,6 +55,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "db", .module = db },
                 .{ .name = "router", .module = router },
+                .{ .name = "config", .module = config },
             },
         }),
     });
