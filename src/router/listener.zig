@@ -2,6 +2,7 @@ const std = @import("std");
 
 const db = @import("db");
 const dns = @import("dns");
+const config = @import("config");
 
 pub const Listener = struct {
     io: std.Io,
@@ -13,8 +14,10 @@ pub const Listener = struct {
     cache: db.Cache,
     postgre: db.Postgre,
 
-    pub fn new(allocator: std.mem.Allocator, io: std.Io, pg_url: []const u8, ip: []const u8, port: u16) !Listener {
-        const addr = try std.Io.net.IpAddress.parse(ip, port);
+    config: config.Config,
+
+    pub fn new(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !Listener {
+        const addr = try std.Io.net.IpAddress.parse(cfg.local.host, cfg.local.port);
 
         const socket = try std.Io.net.IpAddress.bind(&addr, io, .{
             .mode = .dgram,
@@ -28,7 +31,7 @@ pub const Listener = struct {
 
         const cache = db.Cache.init(allocator, io, seed);
 
-        const postgre = try db.Postgre.init(allocator, io, pg_url);
+        const postgre = try db.Postgre.init(allocator, io, cfg.connect.postgre_url);
 
         return .{
             .io = io,
@@ -37,6 +40,7 @@ pub const Listener = struct {
             .socket = socket,
             .cache = cache,
             .postgre = postgre,
+            .config = cfg,
         };
     }
 
@@ -137,26 +141,38 @@ pub const Listener = struct {
             return try self.respond_with_error(&packet.from, &header, question, edns0, .NotImp, .NotTruncated);
         }
 
-        const name = try question.get_name(self.allocator);
-        defer self.allocator.free(name);
+        var buffer: [255]u8 = undefined;
+        const name = question.get_name(&buffer);
 
         const cached = try self.cache.get(name, question.record);
-        if (cached) |answers| {
-            defer {
-                for (answers) |answer| {
-                    self.allocator.free(answer.raw_data);
-                }
-                self.allocator.free(answers);
+        if (cached) |result| {
+            switch (result) {
+                .nodata => {
+                    return try self.respond_with_answers(&packet.from, &header, question, edns0, &.{});
+                },
+                .nxdomain => {
+                    return try self.respond_with_error(&packet.from, &header, question, edns0, .NxDomain, .NotTruncated);
+                },
+                .answers => |answers| {
+                    defer {
+                        for (answers) |answer| {
+                            self.allocator.free(answer.raw_data);
+                        }
+                        self.allocator.free(answers);
+                    }
+                    return try self.respond_with_answers(&packet.from, &header, question, edns0, answers);
+                },
             }
-            return try self.respond_with_answers(&packet.from, &header, question, edns0, answers);
         }
 
         const answers = self.postgre.get(name, question.record) catch |err| {
             switch (err) {
                 db.Postgre.Error.NameExists => {
+                    try self.cache.put_negative(name, question.record, .nodata, self.config.security.nodata_ttl);
                     return try self.respond_with_answers(&packet.from, &header, question, edns0, &.{});
                 },
                 db.Postgre.Error.NxDomain => {
+                    try self.cache.put_negative(name, question.record, .nxdomain, self.config.security.nxdomain_ttl);
                     return try self.respond_with_error(&packet.from, &header, question, edns0, .NxDomain, .NotTruncated);
                 },
                 else => {
@@ -187,6 +203,7 @@ pub const Listener = struct {
         header.flags.qr = .Response;
         header.flags.rcode = rcode;
 
+        header.flags.z = 0;
         header.flags.tc = tc;
         header.flags.aa = .Authoritative;
         header.flags.ra = .RecursionNotAvailable;
@@ -208,7 +225,6 @@ pub const Listener = struct {
 
         if (edns0) |e| {
             header.ar = 1;
-            option.dnssec_ok = e.dnssec_ok;
 
             if (e.version != 0) {
                 header.flags.rcode = .NoError;
@@ -234,11 +250,16 @@ pub const Listener = struct {
         header.ns = 0;
         header.qd = 1;
 
-        header.an = @intCast(records.len);
+        if (records.len > std.math.maxInt(u16)) {
+            return try self.respond_with_error(from, header, question, edns0, .ServFail, .NotTruncated);
+        }
+
+        header.an = @truncate(records.len);
 
         header.flags.qr = .Response;
         header.flags.rcode = .NoError;
 
+        header.flags.z = 0;
         header.flags.tc = .NotTruncated;
         header.flags.aa = .Authoritative;
         header.flags.ra = .RecursionNotAvailable;
@@ -258,7 +279,6 @@ pub const Listener = struct {
 
         if (edns0) |e| {
             header.ar = 1;
-            option.dnssec_ok = e.dnssec_ok;
 
             if (e.version != 0) {
                 header.an = 0;

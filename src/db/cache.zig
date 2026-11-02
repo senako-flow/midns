@@ -24,34 +24,45 @@ pub const CacheKeyContext = struct {
     }
 };
 
-pub const CacheEntry = struct {
+pub const CacheResult = union(enum) {
+    nodata,
+    nxdomain,
+    answers: []dns.Answer,
+};
+
+pub const PositiveEntry = struct {
     answers: std.ArrayList(dns.Answer),
     expires_at: i64,
 };
 
-pub const CacheMap = std.HashMap(CacheKey, CacheEntry, CacheKeyContext, std.hash_map.default_max_load_percentage);
+pub const NegativeStatus = enum {
+    nodata,
+    nxdomain,
+};
+
+pub const NegativeEntry = struct {
+    status: NegativeStatus,
+    expires_at: i64,
+};
+
+pub const PositiveMap = std.HashMap(CacheKey, PositiveEntry, CacheKeyContext, std.hash_map.default_max_load_percentage);
+pub const NegativeMap = std.HashMap(CacheKey, NegativeEntry, CacheKeyContext, std.hash_map.default_max_load_percentage);
 
 pub const Cache = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     mutex: std.Io.RwLock,
 
-    entries: CacheMap,
-    max_entries: usize,
-
-    pub const default_max_entries: usize = 65536;
+    positive_entries: PositiveMap,
+    negative_entries: NegativeMap,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, seed: u64) Cache {
-        return initWithLimit(allocator, io, seed, default_max_entries);
-    }
-
-    pub fn initWithLimit(allocator: std.mem.Allocator, io: std.Io, seed: u64, max_entries: usize) Cache {
         return .{
             .io = io,
             .allocator = allocator,
             .mutex = .init,
-            .entries = CacheMap.initContext(allocator, .{ .seed = seed }),
-            .max_entries = max_entries,
+            .positive_entries = PositiveMap.initContext(allocator, .{ .seed = seed }),
+            .negative_entries = NegativeMap.initContext(allocator, .{ .seed = seed }),
         };
     }
 
@@ -59,8 +70,8 @@ pub const Cache = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var it = self.entries.iterator();
-        while (it.next()) |entry| {
+        var pos_it = self.positive_entries.iterator();
+        while (pos_it.next()) |entry| {
             for (entry.value_ptr.answers.items) |answer| {
                 self.allocator.free(answer.raw_data);
             }
@@ -69,50 +80,73 @@ pub const Cache = struct {
             self.allocator.free(entry.key_ptr.name);
         }
 
-        self.entries.deinit();
+        self.positive_entries.deinit();
+
+        var neg_it = self.negative_entries.iterator();
+        while (neg_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.name);
+        }
+
+        self.negative_entries.deinit();
     }
 
     pub fn delete(self: *Cache, name: []const u8, record: dns.Record) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        return self.delete_locked(name, record);
+        const pos = self.delete_positive_locked(name, record);
+        const neg = self.delete_negative_locked(name, record);
+
+        return pos or neg;
     }
 
-    fn delete_locked(self: *Cache, name: []const u8, record: dns.Record) bool {
+    fn delete_positive_locked(self: *Cache, name: []const u8, record: dns.Record) bool {
         const key = CacheKey{ .name = name, .record = record };
-        const kv = self.entries.fetchRemove(key) orelse return false;
+        const kv = self.positive_entries.fetchRemove(key) orelse {
+            return false;
+        };
 
         for (kv.value.answers.items) |answer| {
             self.allocator.free(answer.raw_data);
         }
 
         var answers = kv.value.answers;
+
         answers.deinit(self.allocator);
         self.allocator.free(kv.key.name);
 
         return true;
     }
 
-    pub fn get(self: *Cache, name: []const u8, record: dns.Record) !?[]dns.Answer {
-        var expired = false;
+    fn delete_negative_locked(self: *Cache, name: []const u8, record: dns.Record) bool {
+        const key = CacheKey{ .name = name, .record = record };
+        const kv = self.negative_entries.fetchRemove(key) orelse {
+            return false;
+        };
 
-        inner: {
-            self.mutex.lockSharedUncancelable(self.io);
-            defer self.mutex.unlockShared(self.io);
+        self.allocator.free(kv.key.name);
 
-            const key = CacheKey{ .name = name, .record = record };
-            const entry = self.entries.get(key) orelse {
+        return true;
+    }
+
+    pub fn get(self: *Cache, name: []const u8, record: dns.Record) !?CacheResult {
+        self.mutex.lockSharedUncancelable(self.io);
+        defer self.mutex.unlockShared(self.io);
+
+        const key = CacheKey{ .name = name, .record = record };
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+
+        if (self.positive_entries.get(key)) |pos_entry| {
+            if (now >= pos_entry.expires_at) {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+
+                _ = self.delete_positive_locked(name, record);
+
                 return null;
-            };
-
-            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-            if (now >= entry.expires_at) {
-                expired = true;
-                break :inner;
             }
 
-            const duped = try self.allocator.alloc(dns.Answer, entry.answers.items.len);
+            const duped = try self.allocator.alloc(dns.Answer, pos_entry.answers.items.len);
             errdefer self.allocator.free(duped);
 
             var count: usize = 0;
@@ -122,55 +156,69 @@ pub const Cache = struct {
                 }
             }
 
-            for (entry.answers.items, 0..) |item, i| {
+            for (pos_entry.answers.items, 0..) |item, i| {
                 const owned_value = try self.allocator.dupe(u8, item.raw_data);
                 duped[i] = item;
                 duped[i].raw_data = owned_value;
                 count += 1;
             }
 
-            return duped;
+            return .{ .answers = duped };
         }
 
-        if (expired) {
-            _ = self.delete(name, record);
+        if (self.negative_entries.get(key)) |neg_entry| {
+            if (now >= neg_entry.expires_at) {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+
+                _ = self.delete_negative_locked(name, record);
+
+                return null;
+            }
+
+            return switch (neg_entry.status) {
+                .nodata => .nodata,
+                .nxdomain => .nxdomain,
+            };
         }
 
         return null;
     }
 
-    fn prune_one_locked(self: *Cache, now: i64) void {
-        var it = self.entries.iterator();
-        while (it.next()) |entry| {
-            if (now >= entry.value_ptr.expires_at) {
-                const name = entry.key_ptr.name;
-                const rec = entry.key_ptr.record;
-                _ = self.delete_locked(name, rec);
-                return;
-            }
+    pub fn put_negative(self: *Cache, name: []const u8, record: dns.Record, status: NegativeStatus, ttl: u32) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        _ = self.delete_positive_locked(name, record);
+
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        const key = CacheKey{ .name = name, .record = record };
+
+        const result = try self.negative_entries.getOrPut(key);
+
+        if (!result.found_existing) {
+            const owned_name = self.allocator.dupe(u8, name) catch |err| {
+                self.negative_entries.removeByPtr(result.key_ptr);
+                return err;
+            };
+
+            result.key_ptr.* = .{ .name = owned_name, .record = record };
         }
 
-        var reset_it = self.entries.iterator();
-        if (reset_it.next()) |entry| {
-            const name = entry.key_ptr.name;
-            const rec = entry.key_ptr.record;
-            _ = self.delete_locked(name, rec);
-        }
+        result.value_ptr.status = status;
+        result.value_ptr.expires_at = now + @as(i64, @intCast(ttl));
     }
 
     pub fn put_slice(self: *Cache, name: []const u8, record: dns.Record, answers: []const dns.Answer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        _ = self.delete_negative_locked(name, record);
 
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         const key = CacheKey{ .name = name, .record = record };
 
-        if (!self.entries.contains(key) and self.entries.count() >= self.max_entries) {
-            self.prune_one_locked(now);
-        }
-
-        const result = try self.entries.getOrPut(key);
+        const result = try self.positive_entries.getOrPut(key);
 
         if (result.found_existing) {
             for (result.value_ptr.answers.items) |answer| {
@@ -182,7 +230,7 @@ pub const Cache = struct {
 
         if (!result.found_existing) {
             const owned_name = self.allocator.dupe(u8, name) catch |err| {
-                self.entries.removeByPtr(result.key_ptr);
+                self.positive_entries.removeByPtr(result.key_ptr);
                 return err;
             };
 
