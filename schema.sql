@@ -12,7 +12,7 @@ CREATE TABLE records (
     id         BIGINT PRIMARY KEY,
     zone_id    BIGINT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
 
-    ttl        INT NOT NULL DEFAULT 300,
+    ttl        INT NOT NULL DEFAULT 300 CHECK (ttl >= 0),
     name       VARCHAR(253) NOT NULL CHECK (name = lower(name)),
     record     INT NOT NULL,
 

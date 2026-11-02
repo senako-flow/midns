@@ -155,11 +155,10 @@ pub const Question = struct {
         return self.raw.len + 4;
     }
 
-    pub fn get_name(self: Question, allocator: std.mem.Allocator) ![]u8 {
-        var respond: std.ArrayList(u8) = .empty;
-        errdefer respond.deinit(allocator);
-
+    pub fn get_name(self: Question, buffer: *[255]u8) []const u8 {
+        var out_len: usize = 0;
         var i: usize = 0;
+
         while (i < self.raw.len) {
             const label = self.raw[i];
 
@@ -169,18 +168,22 @@ pub const Question = struct {
 
             i += 1;
 
-            if (respond.items.len > 0) {
-                try respond.append(allocator, '.');
+            if (out_len > 0 and out_len < buffer.len) {
+                buffer[out_len] = '.';
+                out_len += 1;
             }
 
             for (self.raw[i .. i + label]) |c| {
-                try respond.append(allocator, std.ascii.toLower(c));
+                if (out_len < buffer.len) {
+                    buffer[out_len] = std.ascii.toLower(c);
+                    out_len += 1;
+                }
             }
 
             i += label;
         }
 
-        return respond.toOwnedSlice(allocator);
+        return buffer[0..out_len];
     }
 };
 
@@ -250,12 +253,16 @@ pub const Answer = struct {
     }
 
     pub fn encode(self: Answer, writer: *std.Io.Writer) !void {
+        if (self.raw_data.len > std.math.maxInt(u16)) {
+            return error.DataTooLong;
+        }
+
         var buffer: [10]u8 = undefined;
 
         std.mem.writeInt(u16, buffer[0..2], @backingInt(self.record), .big);
         std.mem.writeInt(u16, buffer[2..4], @backingInt(self.class), .big);
         std.mem.writeInt(u32, buffer[4..8], self.ttl, .big);
-        std.mem.writeInt(u16, buffer[8..10], @intCast(self.raw_data.len), .big);
+        std.mem.writeInt(u16, buffer[8..10], @truncate(self.raw_data.len), .big);
 
         try writer.writeAll(self.name);
         try writer.writeAll(&buffer);

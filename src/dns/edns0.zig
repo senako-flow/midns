@@ -35,7 +35,7 @@ pub const Edns0 = struct {
         const rcode = v[5];
         const version = v[6];
         const flags = std.mem.readInt(u16, v[7..9], .big);
-        const rdlen = std.mem.readInt(u16, v[9..11], .big);
+        const rdlen: usize = @intCast(std.mem.readInt(u16, v[9..11], .big));
 
         if (v.len < 11 + rdlen) {
             return Error.RdlenMismatch;
